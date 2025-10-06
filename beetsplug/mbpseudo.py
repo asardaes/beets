@@ -14,23 +14,24 @@
 
 """Adds pseudo-releases from MusicBrainz as candidates during import."""
 
-import functools
-import itertools
 from copy import deepcopy
 from typing import Any, Iterable, Optional, Sequence
 
-import beets
+import musicbrainzngs
 from typing_extensions import override
 
-from beets.autotag import AlbumInfo
 from beets.autotag.distance import Distance, distance
-from beets.autotag.hooks import TrackInfo
+from beets.autotag.hooks import AlbumInfo, TrackInfo
 from beets.autotag.match import assign_items
 from beets.library import Item
 from beets.plugins import find_plugins
 from beets.util.id_extractors import extract_release_id
 from beetsplug._typing import JSONDict
-from beetsplug.musicbrainz import MusicBrainzPlugin
+from beetsplug.musicbrainz import (
+    RELEASE_INCLUDES,
+    MusicBrainzPlugin,
+    merge_pseudo_and_actual_album,
+)
 
 _STATUS_PSEUDO = "Pseudo-Release"
 
@@ -56,6 +57,7 @@ class MusicBrainzPseudoReleasePlugin(MusicBrainzPlugin):
                     " the mbpseudo plugin"
                 )
 
+    @override
     def candidates(
         self,
         items: Sequence[Item],
@@ -65,41 +67,50 @@ class MusicBrainzPseudoReleasePlugin(MusicBrainzPlugin):
     ) -> Iterable[AlbumInfo]:
         if len(self._scripts) == 0:
             yield from super().candidates(items, artist, album, va_likely)
+        else:
+            for album_info in super().candidates(
+                items, artist, album, va_likely
+            ):
+                if isinstance(album_info, PseudoAlbumInfo):
+                    yield album_info.get_official_release()
+                    self._log.debug(
+                        "Using {0} release for distance calculations for album {1}",
+                        album_info.determine_best_ref(items),
+                        album_info.album_id,
+                    )
 
-        criteria = super().get_album_criteria(items, artist, album, va_likely)
-        raw_releases = super()._search_api("release", criteria)
+                yield album_info
 
-        main_releases = list(
-            map(super().album_for_id, (r["id"] for r in raw_releases))
-        )
-        for main_release in main_releases:
-            main_release.data_source = "MusicBrainz"
+    @override
+    def album_info(self, release: JSONDict) -> Optional[AlbumInfo]:
+        official_release = super().album_info(release)
+        if official_release is None:
+            return None
 
-        pseudo_release_ids = map(self._intercept_mb_release, raw_releases)
-        pseudo_release_generator = functools.partial(
-            self._get_pseudo_releases, items
-        )
-        pseudo_releases = itertools.starmap(
-            pseudo_release_generator, zip(main_releases, pseudo_release_ids)
-        )
+        official_release.data_source = "MusicBrainz"
 
-        all_releases = itertools.chain(
-            iter(main_releases),
-            itertools.chain.from_iterable(pseudo_releases),  # flatten
-        )
-
-        yield from filter(None, all_releases)
-
-    def album_info(self, release: JSONDict) -> beets.autotag.hooks.AlbumInfo:
-        return super().album_info(release)
+        if release.get("status") == _STATUS_PSEUDO:
+            return official_release
+        elif pseudo_release_ids := self._intercept_mb_release(release):
+            album_id = self._extract_id(pseudo_release_ids[0])
+            raw_pseudo_release = musicbrainzngs.get_release_by_id(
+                album_id, RELEASE_INCLUDES
+            )
+            pseudo_release = super().album_info(raw_pseudo_release["release"])
+            return PseudoAlbumInfo(
+                pseudo_release=merge_pseudo_and_actual_album(
+                    pseudo_release, official_release
+                ),
+                official_release=official_release,
+                data_source=self.data_source,
+            )
+        else:
+            return official_release
 
     def _intercept_mb_release(self, data: JSONDict) -> list[str]:
         album_id = data["id"] if "id" in data else None
         if self._has_desired_script(data) or not isinstance(album_id, str):
-            self._log.debug("already Latn {0}", data)
             return []
-        else:
-            self._log.debug("raw: {0}", data)  # TODO rm
 
         return [
             pr_id
@@ -121,7 +132,6 @@ class MusicBrainzPseudoReleasePlugin(MusicBrainzPlugin):
         album_id: str,
         relation: JSONDict,
     ) -> Optional[str]:
-        self._log.debug("{0}", relation)  # TODO rm
         if (
             len(self._scripts) == 0
             or relation.get("type", "") != "transl-tracklisting"
@@ -140,35 +150,6 @@ class MusicBrainzPseudoReleasePlugin(MusicBrainzPlugin):
             return release["id"]
         else:
             return None
-
-    def _get_pseudo_releases(
-        self,
-        items: Sequence[Item],
-        official_release: Optional[AlbumInfo],
-        pseudo_release_ids: list[str],
-    ) -> list[AlbumInfo]:
-        pseudo_releases: list[AlbumInfo] = []
-        self._log.debug(  # TODO rm
-            "Processing {0} -> {1}", official_release.data_url, pseudo_release_ids
-        )
-        if official_release is None:
-            return pseudo_releases
-
-        for pr_id in pseudo_release_ids:
-            if match := super().album_for_id(pr_id):
-                pseudo_album_info = PseudoAlbumInfo(
-                    pseudo_release=match,
-                    official_release=official_release,
-                    data_source=self.data_source,
-                )
-                self._log.debug(
-                    "Using {0} release for distance calculations for album {1}",
-                    pseudo_album_info.determine_best_ref(items),
-                    pr_id,
-                )
-                pseudo_releases.append(pseudo_album_info)
-
-        return pseudo_releases
 
     @override
     def album_distance(
@@ -198,6 +179,7 @@ class MusicBrainzPseudoReleasePlugin(MusicBrainzPlugin):
 
         return super().album_distance(items, album_info, mapping)
 
+    @override
     def _extract_id(self, url: str) -> Optional[str]:
         return extract_release_id("MusicBrainz", url)
 
@@ -229,6 +211,9 @@ class PseudoAlbumInfo(AlbumInfo):
         for k, v in pseudo_release.items():
             if k not in kwargs:
                 self[k] = v
+
+    def get_official_release(self) -> AlbumInfo:
+        return self.__dict__["_official_release"]
 
     def determine_best_ref(self, items: Sequence[Item]) -> str:
         self.use_pseudo_as_ref()

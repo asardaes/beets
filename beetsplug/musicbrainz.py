@@ -321,7 +321,7 @@ def _find_actual_release_from_pseudo_release(
     return musicbrainzngs.get_release_by_id(actual_id, RELEASE_INCLUDES)
 
 
-def _merge_pseudo_and_actual_album(
+def merge_pseudo_and_actual_album(
     pseudo: beets.autotag.hooks.AlbumInfo, actual: beets.autotag.hooks.AlbumInfo
 ) -> beets.autotag.hooks.AlbumInfo | None:
     """
@@ -872,7 +872,7 @@ class MusicBrainzPlugin(MetadataSourcePlugin):
         # should be None unless we're dealing with a pseudo release
         if actual_res is not None:
             actual_release = self.album_info(actual_res["release"])
-            return _merge_pseudo_and_actual_album(release, actual_release)
+            return merge_pseudo_and_actual_album(release, actual_release)
         else:
             return release
 
