@@ -134,9 +134,11 @@ class FtInTitlePlugin(plugins.BeetsPlugin):
         if self.config["auto"]:
             self.import_stages = [self.imported]
 
-        self.album_template_fields["album_artist_no_feat"] = (
-            _album_artist_no_feat
-        )
+        # help mypy .-.
+        if album_template_fields := self.album_template_fields:
+            album_template_fields["album_artist_no_feat"] = (
+                _album_artist_no_feat
+            )
 
     def commands(self) -> list[ui.Subcommand]:
         def func(lib, opts, args):
